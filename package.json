@@ -26,7 +26,7 @@
     "format": "prettier --write ."
   },
   "dependencies": {
-    "@novachat-enterprise-erp/common": "^0.1.0",
+    "@novachat-enterprise-erp/common": "^0.1.1",
     "@novachat-enterprise-erp/contracts": "^0.1.0",
     "@novachat-enterprise-erp/events": "^0.1.0",
     "drizzle-orm": "0.45.4",

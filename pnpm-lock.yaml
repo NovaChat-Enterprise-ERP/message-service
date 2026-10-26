@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@novachat-enterprise-erp/common':
-        specifier: ^0.1.0
-        version: 0.1.0(express@5.3.0)
+        specifier: ^0.1.1
+        version: 0.1.1(express@5.3.0)
       '@novachat-enterprise-erp/contracts':
         specifier: ^0.1.0
         version: 0.1.0
@@ -604,8 +604,8 @@ packages:
     resolution: {integrity: sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==}
     engines: {node: ^14.21.3 || >=16}
 
-  '@novachat-enterprise-erp/common@0.1.0':
-    resolution: {integrity: sha512-SJbd44UJzWzZ4q4ljmFF44O5MxrwgvGbxeWjeW3Q6l+FN6yKc6hIzxqwmMwhuIoP+LQBhhCdVYa0ptikCVulBA==, tarball: https://npm.pkg.github.com/download/@novachat-enterprise-erp/common/0.1.0/a6cc710be0e697c0005c1edc03e1b7dc0b597832}
+  '@novachat-enterprise-erp/common@0.1.1':
+    resolution: {integrity: sha512-jWN0PbZhwRnb33g2UD7EfpSmJ+1NklNUm7GZvnWhqKqtdN7rjdTaXHJG5vJ3dcRPv7+l3SvFVRrrVWya187chQ==, tarball: https://npm.pkg.github.com/download/@novachat-enterprise-erp/common/0.1.1/0761ac2246d7399d94f09c79ce043c114de8e6ae}
     peerDependencies:
       express: ^5.1.0
 
@@ -2371,7 +2371,7 @@ snapshots:
 
   '@noble/hashes@1.8.0': {}
 
-  '@novachat-enterprise-erp/common@0.1.0(express@5.3.0)':
+  '@novachat-enterprise-erp/common@0.1.1(express@5.3.0)':
     dependencies:
       '@novachat-enterprise-erp/contracts': 0.1.0
       express: 5.3.0
@@ -2395,7 +2395,7 @@ snapshots:
   '@novachat-enterprise-erp/testing@0.1.0(@types/pg@8.23.1)(express@5.3.0)(pg@8.23.1)':
     dependencies:
       '@electric-sql/pglite': 0.5.8
-      '@novachat-enterprise-erp/common': 0.1.0(express@5.3.0)
+      '@novachat-enterprise-erp/common': 0.1.1(express@5.3.0)
       '@novachat-enterprise-erp/contracts': 0.1.0
       drizzle-orm: 0.45.4(@electric-sql/pglite@0.5.8)(@types/pg@8.23.1)(pg@8.23.1)
     transitivePeerDependencies:

@@ -20,7 +20,7 @@ import type { EventPublisher } from '@novachat-enterprise-erp/events';
 import type { ConversationRow } from '../db/schema.js';
 import type { UnitOfWork } from '../repositories/unit-of-work.js';
 import type { WorkspaceDirectory } from '../providers/workspace-directory.js';
-import { ConversationPolicy, isChannel } from './conversation.policy.js';
+import { isChannel, type ConversationPolicy } from './conversation.policy.js';
 import { conversationRef, toConversationDto } from './mappers.js';
 
 const DEFAULT_CHANNELS = [

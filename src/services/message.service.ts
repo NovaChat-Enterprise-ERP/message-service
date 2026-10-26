@@ -23,7 +23,7 @@ import type { EventPublisher } from '@novachat-enterprise-erp/events';
 import type { ConversationMemberRow, ConversationRow, MessageRow } from '../db/schema.js';
 import type { Cursor } from '../repositories/message.repository.js';
 import type { UnitOfWork } from '../repositories/unit-of-work.js';
-import { ConversationPolicy, isChannel } from './conversation.policy.js';
+import { isChannel, type ConversationPolicy } from './conversation.policy.js';
 import { conversationRef, groupReactions, toMessageDto } from './mappers.js';
 
 export const toTsQuery = (q: string): string | null => {
