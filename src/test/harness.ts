@@ -6,6 +6,7 @@ import { TEST_SECRET, asUser, createTestDatabase } from '@novachat-enterprise-er
 import { schema } from '../db/schema.js';
 import type { Database } from '../db/client.js';
 import { DrizzleUnitOfWork } from '../repositories/unit-of-work.js';
+import { OutboxRelay } from '../events/outbox-relay.js';
 import type { WorkspaceDirectory } from '../providers/workspace-directory.js';
 import { buildContainer } from '../container.js';
 import { createApp } from '../app.js';
@@ -33,13 +34,12 @@ export const createHarness = async () => {
   const { db, close } = await createTestDatabase(schema, migrations, 'messaging');
   const events = new InMemoryEventBus('message-service');
   const directory = new FakeDirectory();
-  const container = buildContainer({
-    logger: createLogger('test', 'silent'),
-    internalSecret: TEST_SECRET,
-    uow: new DrizzleUnitOfWork(db as unknown as Database),
-    directory,
-    events,
-  });
+  const logger = createLogger('test', 'silent');
+  const uow = new DrizzleUnitOfWork(db as unknown as Database);
+  // The relay is not started in tests: call flushEvents() to move committed outbox rows to `events`.
+  const relay = new OutboxRelay(uow, { deliver: (event) => events.publish(event) }, { logger });
+  const flushEvents = () => relay.drain();
+  const container = buildContainer({ logger, internalSecret: TEST_SECRET, uow, directory });
 
   const as = (userId: string, workspaceId = WS) => {
     const role = ROLES[userId] ?? 'member';
@@ -52,5 +52,15 @@ export const createHarness = async () => {
     });
   };
 
-  return { app: createApp(container), container, events, directory, close, as };
+  return {
+    app: createApp(container),
+    container,
+    events,
+    directory,
+    close,
+    as,
+    uow,
+    relay,
+    flushEvents,
+  };
 };

@@ -29,6 +29,7 @@ describe('workspace provisioning', () => {
     const names = (await mine('ada')).map((c) => c.name).sort();
     expect(names).toEqual(['general', 'random']);
     expect(general.isDefault).toBe(true);
+    await h.flushEvents();
     expect(h.events.ofType(EVENTS.CONVERSATION_MEMBER_ADDED).length).toBeGreaterThan(0);
   });
 
@@ -127,8 +128,11 @@ describe('messages', () => {
     await request(h.app).post(`${base}/conversations/${general.id}/read`).set(h.as('grace')).send({}).expect(204);
     expect((await mine('grace')).find((c) => c.id === general.id)!.membership?.unreadCount).toBe(0);
 
-    const created = h.events.ofType<{ message: MessageDto }>(EVENTS.MESSAGE_CREATED).at(-1)!;
-    expect(created.data.message.mentions).toEqual(['grace']);
+    await h.flushEvents();
+    const created = h.events.ofType<{ message: MessageDto }>(EVENTS.MESSAGE_CREATED);
+    // The duplicate send must not emit a second message.created.
+    expect(created.filter((e) => e.data.message.id === first.id)).toHaveLength(1);
+    expect(created.at(-1)!.data.message.mentions).toEqual(['grace']);
   });
 
   it('rejects empty messages and non-members', async () => {

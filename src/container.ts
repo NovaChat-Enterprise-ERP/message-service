@@ -1,5 +1,4 @@
 import type { Logger, ReadinessCheck } from '@novachat-enterprise-erp/common';
-import type { EventPublisher } from '@novachat-enterprise-erp/events';
 import type { UnitOfWork } from './repositories/unit-of-work.js';
 import type { WorkspaceDirectory } from './providers/workspace-directory.js';
 import { ConversationPolicy } from './services/conversation.policy.js';
@@ -14,15 +13,14 @@ export interface ContainerDeps {
   internalSecret: string;
   uow: UnitOfWork;
   directory: WorkspaceDirectory;
-  events: EventPublisher;
   readiness?: Record<string, ReadinessCheck>;
 }
 
 export const buildContainer = (deps: ContainerDeps) => {
   const policy = new ConversationPolicy();
   const services = {
-    conversations: new ConversationService(deps.uow, policy, deps.directory, deps.events),
-    messages: new MessageService(deps.uow, policy, deps.events),
+    conversations: new ConversationService(deps.uow, policy, deps.directory),
+    messages: new MessageService(deps.uow, policy),
   };
   return {
     logger: deps.logger,
