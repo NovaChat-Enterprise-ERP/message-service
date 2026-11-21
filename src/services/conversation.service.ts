@@ -16,9 +16,8 @@ import {
   isUniqueViolation,
   type MemberContext,
 } from '@novachat-enterprise-erp/common';
-import type { EventPublisher } from '@novachat-enterprise-erp/events';
 import type { ConversationRow } from '../db/schema.js';
-import type { UnitOfWork } from '../repositories/unit-of-work.js';
+import type { Repositories, UnitOfWork } from '../repositories/unit-of-work.js';
 import type { WorkspaceDirectory } from '../providers/workspace-directory.js';
 import { isChannel, type ConversationPolicy } from './conversation.policy.js';
 import { conversationRef, toConversationDto } from './mappers.js';
@@ -33,7 +32,6 @@ export class ConversationService {
     private readonly uow: UnitOfWork,
     private readonly policy: ConversationPolicy,
     private readonly directory: WorkspaceDirectory,
-    private readonly events: EventPublisher,
   ) {}
 
   async listMine(actor: MemberContext): Promise<ConversationDto[]> {
@@ -51,8 +49,12 @@ export class ConversationService {
     return items.map(toConversationDto);
   }
 
-  async get(actor: MemberContext, conversationId: string): Promise<ConversationDto> {
-    const item = await this.uow.repos.conversations.getForUser(conversationId, actor.userId);
+  get(actor: MemberContext, conversationId: string): Promise<ConversationDto> {
+    return this.getWith(this.uow.repos, actor, conversationId);
+  }
+
+  private async getWith(repos: Repositories, actor: MemberContext, conversationId: string): Promise<ConversationDto> {
+    const item = await repos.conversations.getForUser(conversationId, actor.userId);
     this.policy.assertCanView(item?.conversation ?? null, actor, item?.membership ?? null);
     return toConversationDto(item!);
   }
@@ -73,9 +75,9 @@ export class ConversationService {
           createdBy: actor.userId,
         });
         await repos.conversations.addMembers(row.id, actor.workspaceId, memberIds);
+        await this.publishCreated(repos, row, memberIds, actor.userId);
         return row;
       });
-      await this.publishCreated(conversation, memberIds, actor.userId);
       return this.get(actor, conversation.id);
     } catch (error) {
       if (isUniqueViolation(error)) throw new ConflictError(`A channel named #${input.name} already exists`);
@@ -102,9 +104,9 @@ export class ConversationService {
           createdBy: actor.userId,
         });
         await repos.conversations.addMembers(row.id, actor.workspaceId, participants);
+        await this.publishCreated(repos, row, participants, actor.userId);
         return row;
       });
-      await this.publishCreated(conversation, participants, actor.userId);
       return this.get(actor, conversation.id);
     } catch (error) {
       if (!isUniqueViolation(error)) throw error;
@@ -120,23 +122,27 @@ export class ConversationService {
 
     const { isPrivate, ...rest } = input;
     try {
-      await this.uow.repos.conversations.update(conversation.id, {
-        ...rest,
-        ...(isPrivate === undefined ? {} : { type: isPrivate ? 'private_channel' : 'public_channel' }),
+      return await this.uow.transaction(async (repos) => {
+        await repos.conversations.update(conversation.id, {
+          ...rest,
+          ...(isPrivate === undefined ? {} : { type: isPrivate ? 'private_channel' : 'public_channel' }),
+        });
+        return this.publishUpdated(repos, actor, conversation.id);
       });
     } catch (error) {
       if (isUniqueViolation(error)) throw new ConflictError(`A channel named #${input.name} already exists`);
       throw error;
     }
-    return this.publishUpdated(actor, conversation.id);
   }
 
   async setArchived(actor: MemberContext, conversationId: string, archived: boolean): Promise<ConversationDto> {
     const conversation = await this.load(actor, conversationId);
     this.policy.assertCanManage(conversation, actor);
     if (conversation.isDefault) throw new BadRequestError('Default channels cannot be archived');
-    await this.uow.repos.conversations.update(conversation.id, { archivedAt: archived ? new Date() : null });
-    return this.publishUpdated(actor, conversation.id, archived ? EVENTS.CONVERSATION_ARCHIVED : EVENTS.CONVERSATION_UPDATED);
+    return this.uow.transaction(async (repos) => {
+      await repos.conversations.update(conversation.id, { archivedAt: archived ? new Date() : null });
+      return this.publishUpdated(repos, actor, conversation.id, archived ? EVENTS.CONVERSATION_ARCHIVED : EVENTS.CONVERSATION_UPDATED);
+    });
   }
 
   async delete(actor: MemberContext, conversationId: string): Promise<void> {
@@ -144,13 +150,15 @@ export class ConversationService {
     this.policy.assertChannel(conversation);
     if (!actor.permissions.includes(PERMISSIONS.CHANNELS_MANAGE)) throw new ForbiddenError('Missing permission: channels:manage');
     if (conversation.isDefault) throw new BadRequestError('Default channels cannot be deleted');
-    const memberUserIds = await this.uow.repos.conversations.listMemberIds(conversation.id);
-    await this.uow.repos.conversations.delete(conversation.id);
-    await this.events.publish({
-      type: EVENTS.CONVERSATION_DELETED,
-      workspaceId: actor.workspaceId,
-      actorId: actor.userId,
-      data: { conversationId: conversation.id, memberUserIds },
+    await this.uow.transaction(async (repos) => {
+      const memberUserIds = await repos.conversations.listMemberIds(conversation.id);
+      await repos.conversations.delete(conversation.id);
+      await repos.events.publish({
+        type: EVENTS.CONVERSATION_DELETED,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        data: { conversationId: conversation.id, memberUserIds },
+      });
     });
   }
 
@@ -166,9 +174,11 @@ export class ConversationService {
     const conversation = await this.load(actor, conversationId);
     this.policy.assertChannel(conversation);
     if (conversation.isDefault) throw new BadRequestError(`You cannot leave #${conversation.name}`);
-    if (await this.uow.repos.conversations.removeMember(conversation.id, actor.userId)) {
-      await this.publishMemberRemoved(actor.workspaceId, actor.userId, conversation.id, [actor.userId]);
-    }
+    await this.uow.transaction(async (repos) => {
+      if (await repos.conversations.removeMember(conversation.id, actor.userId)) {
+        await this.publishMemberRemoved(repos, actor.workspaceId, actor.userId, conversation.id, [actor.userId]);
+      }
+    });
   }
 
   async listMembers(actor: MemberContext, conversationId: string): Promise<string[]> {
@@ -190,9 +200,11 @@ export class ConversationService {
     this.policy.assertCanManage(conversation, actor);
     if (userId === actor.userId) throw new BadRequestError('Use leave to remove yourself');
     if (conversation.isDefault) throw new BadRequestError('People cannot be removed from default channels');
-    if (await this.uow.repos.conversations.removeMember(conversation.id, userId)) {
-      await this.publishMemberRemoved(actor.workspaceId, actor.userId, conversation.id, [userId]);
-    }
+    await this.uow.transaction(async (repos) => {
+      if (await repos.conversations.removeMember(conversation.id, userId)) {
+        await this.publishMemberRemoved(repos, actor.workspaceId, actor.userId, conversation.id, [userId]);
+      }
+    });
   }
 
   async markRead(actor: MemberContext, conversationId: string, messageId?: string): Promise<void> {
@@ -217,7 +229,7 @@ export class ConversationService {
     if ((await this.uow.repos.conversations.findDefaults(workspaceId)).length > 0) return;
     for (const channel of DEFAULT_CHANNELS) {
       try {
-        const row = await this.uow.transaction(async (repos) => {
+        await this.uow.transaction(async (repos) => {
           const created = await repos.conversations.create({
             workspaceId,
             type: 'public_channel',
@@ -227,9 +239,8 @@ export class ConversationService {
             createdBy: ownerUserId,
           });
           await repos.conversations.addMembers(created.id, workspaceId, [ownerUserId]);
-          return created;
+          await this.publishCreated(repos, created, [ownerUserId], ownerUserId);
         });
-        await this.publishCreated(row, [ownerUserId], ownerUserId);
       } catch (error) {
         if (!isUniqueViolation(error)) throw error;
       }
@@ -237,15 +248,19 @@ export class ConversationService {
   }
 
   async onMemberJoined(workspaceId: string, userId: string): Promise<void> {
-    for (const channel of await this.uow.repos.conversations.findDefaults(workspaceId)) {
-      const added = await this.uow.repos.conversations.addMembers(channel.id, workspaceId, [userId]);
-      if (added.length) await this.publishMemberAdded(workspaceId, userId, channel.id, added);
-    }
+    await this.uow.transaction(async (repos) => {
+      for (const channel of await repos.conversations.findDefaults(workspaceId)) {
+        const added = await repos.conversations.addMembers(channel.id, workspaceId, [userId]);
+        if (added.length) await this.publishMemberAdded(repos, workspaceId, userId, channel.id, added);
+      }
+    });
   }
 
   async onMemberRemoved(workspaceId: string, userId: string): Promise<void> {
-    const ids = await this.uow.repos.conversations.removeUserFromChannels(workspaceId, userId);
-    for (const id of ids) await this.publishMemberRemoved(workspaceId, userId, id, [userId]);
+    await this.uow.transaction(async (repos) => {
+      const ids = await repos.conversations.removeUserFromChannels(workspaceId, userId);
+      for (const id of ids) await this.publishMemberRemoved(repos, workspaceId, userId, id, [userId]);
+    });
   }
 
   async access(conversationId: string, userId: string, includeMembers: boolean): Promise<ConversationAccessDto> {
@@ -271,14 +286,16 @@ export class ConversationService {
     return item!.conversation;
   }
 
-  private async addAndPublish(actor: MemberContext, conversation: ConversationRow, userIds: string[]): Promise<string[]> {
-    const added = await this.uow.repos.conversations.addMembers(conversation.id, actor.workspaceId, userIds);
-    if (added.length) await this.publishMemberAdded(actor.workspaceId, actor.userId, conversation.id, added);
-    return added;
+  private addAndPublish(actor: MemberContext, conversation: ConversationRow, userIds: string[]): Promise<string[]> {
+    return this.uow.transaction(async (repos) => {
+      const added = await repos.conversations.addMembers(conversation.id, actor.workspaceId, userIds);
+      if (added.length) await this.publishMemberAdded(repos, actor.workspaceId, actor.userId, conversation.id, added);
+      return added;
+    });
   }
 
-  private publishCreated(conversation: ConversationRow, memberUserIds: string[], actorId: string) {
-    return this.events.publish({
+  private publishCreated(repos: Repositories, conversation: ConversationRow, memberUserIds: string[], actorId: string) {
+    return repos.events.publish({
       type: EVENTS.CONVERSATION_CREATED,
       workspaceId: conversation.workspaceId,
       actorId,
@@ -286,10 +303,15 @@ export class ConversationService {
     });
   }
 
-  private async publishUpdated(actor: MemberContext, conversationId: string, type: EventType = EVENTS.CONVERSATION_UPDATED) {
-    const dto = await this.get(actor, conversationId);
-    const memberUserIds = await this.uow.repos.conversations.listMemberIds(conversationId);
-    await this.events.publish({
+  private async publishUpdated(
+    repos: Repositories,
+    actor: MemberContext,
+    conversationId: string,
+    type: EventType = EVENTS.CONVERSATION_UPDATED,
+  ) {
+    const dto = await this.getWith(repos, actor, conversationId);
+    const memberUserIds = await repos.conversations.listMemberIds(conversationId);
+    await repos.events.publish({
       type,
       workspaceId: actor.workspaceId,
       actorId: actor.userId,
@@ -298,8 +320,8 @@ export class ConversationService {
     return dto;
   }
 
-  private publishMemberAdded(workspaceId: string, actorId: string, conversationId: string, userIds: string[]) {
-    return this.events.publish({
+  private publishMemberAdded(repos: Repositories, workspaceId: string, actorId: string, conversationId: string, userIds: string[]) {
+    return repos.events.publish({
       type: EVENTS.CONVERSATION_MEMBER_ADDED,
       workspaceId,
       actorId,
@@ -307,8 +329,8 @@ export class ConversationService {
     });
   }
 
-  private publishMemberRemoved(workspaceId: string, actorId: string, conversationId: string, userIds: string[]) {
-    return this.events.publish({
+  private publishMemberRemoved(repos: Repositories, workspaceId: string, actorId: string, conversationId: string, userIds: string[]) {
+    return repos.events.publish({
       type: EVENTS.CONVERSATION_MEMBER_REMOVED,
       workspaceId,
       actorId,

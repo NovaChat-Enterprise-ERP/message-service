@@ -19,10 +19,9 @@ import {
   isUniqueViolation,
   type MemberContext,
 } from '@novachat-enterprise-erp/common';
-import type { EventPublisher } from '@novachat-enterprise-erp/events';
 import type { ConversationMemberRow, ConversationRow, MessageRow } from '../db/schema.js';
 import type { Cursor } from '../repositories/message.repository.js';
-import type { UnitOfWork } from '../repositories/unit-of-work.js';
+import type { Repositories, UnitOfWork } from '../repositories/unit-of-work.js';
 import { isChannel, type ConversationPolicy } from './conversation.policy.js';
 import { conversationRef, groupReactions, toMessageDto } from './mappers.js';
 
@@ -47,7 +46,6 @@ export class MessageService {
   constructor(
     private readonly uow: UnitOfWork,
     private readonly policy: ConversationPolicy,
-    private readonly events: EventPublisher,
   ) {}
 
   async list(actor: MemberContext, conversationId: string, cursor: string | undefined, limit: number): Promise<Page<MessageDto>> {
@@ -101,16 +99,16 @@ export class MessageService {
           await repos.conversations.update(conversationId, { lastMessageAt: created.createdAt });
           await repos.conversations.markRead(conversationId, actor.userId, created.createdAt);
         }
+        await this.publishCreated(repos, actor.userId, conversation, toMessageDto(created), root);
         return created;
       });
     } catch (error) {
       if (!isUniqueViolation(error) || !input.clientMsgId) throw error;
+      // A concurrent retry won the race; its transaction already queued message.created.
       message = (await this.uow.repos.messages.findByClientMsgId(actor.userId, input.clientMsgId))!;
     }
 
-    const dto = (await this.hydrate([message]))[0]!;
-    await this.publishCreated(actor.userId, conversation, dto, root);
-    return dto;
+    return (await this.hydrate([message]))[0]!;
   }
 
   async get(actor: MemberContext, messageId: string): Promise<MessageDto> {
@@ -123,16 +121,18 @@ export class MessageService {
     if (message.authorId !== actor.userId || message.kind !== 'user') throw new ForbiddenError('You can only edit your own messages');
     if (message.deletedAt) throw new BadRequestError('This message was deleted');
     const conversation = (await this.uow.repos.conversations.findById(message.conversationId))!;
-    const updated = await this.uow.repos.messages.update(message.id, {
-      body: input.body,
-      text: input.text,
-      mentions: [...new Set(input.mentions)].filter((id) => id !== actor.userId),
-      mentionsChannel: input.mentionsChannel && isChannel(conversation),
-      editedAt: new Date(),
+    return this.uow.transaction(async (repos) => {
+      const updated = await repos.messages.update(message.id, {
+        body: input.body,
+        text: input.text,
+        mentions: [...new Set(input.mentions)].filter((id) => id !== actor.userId),
+        mentionsChannel: input.mentionsChannel && isChannel(conversation),
+        editedAt: new Date(),
+      });
+      const dto = (await this.hydrate([updated!], repos))[0]!;
+      await this.publishMessageEvent(repos, EVENTS.MESSAGE_UPDATED, actor, dto);
+      return dto;
     });
-    const dto = (await this.hydrate([updated!]))[0]!;
-    await this.publishMessageEvent(EVENTS.MESSAGE_UPDATED, actor, dto);
-    return dto;
   }
 
   async delete(actor: MemberContext, messageId: string): Promise<void> {
@@ -143,12 +143,12 @@ export class MessageService {
     await this.uow.transaction(async (repos) => {
       await repos.messages.update(message.id, { deletedAt: new Date(), text: '', body: null, attachments: [] });
       if (message.parentId) await repos.messages.removeReply(message.parentId);
-    });
-    await this.events.publish({
-      type: EVENTS.MESSAGE_DELETED,
-      workspaceId: actor.workspaceId,
-      actorId: actor.userId,
-      data: { messageId: message.id, conversationId: message.conversationId, parentId: message.parentId },
+      await repos.events.publish({
+        type: EVENTS.MESSAGE_DELETED,
+        workspaceId: actor.workspaceId,
+        actorId: actor.userId,
+        data: { messageId: message.id, conversationId: message.conversationId, parentId: message.parentId },
+      });
     });
   }
 
@@ -168,37 +168,41 @@ export class MessageService {
   async react(actor: MemberContext, messageId: string, emoji: string, add: boolean): Promise<MessageDto> {
     const message = await this.loadMessage(actor, messageId, true);
     if (message.deletedAt) throw new BadRequestError('This message was deleted');
-    const changed = add
-      ? await this.uow.repos.messages.addReaction(message.id, actor.userId, emoji)
-      : await this.uow.repos.messages.removeReaction(message.id, actor.userId, emoji);
-    const dto = (await this.hydrate([message]))[0]!;
-    if (changed) {
-      await this.events.publish({
-        type: add ? EVENTS.REACTION_ADDED : EVENTS.REACTION_REMOVED,
-        workspaceId: actor.workspaceId,
-        actorId: actor.userId,
-        data: {
-          messageId: dto.id,
-          conversationId: dto.conversationId,
-          parentId: dto.parentId,
-          authorId: dto.authorId,
-          emoji,
-          reactions: dto.reactions,
-        },
-      });
-    }
-    return dto;
+    return this.uow.transaction(async (repos) => {
+      const changed = add
+        ? await repos.messages.addReaction(message.id, actor.userId, emoji)
+        : await repos.messages.removeReaction(message.id, actor.userId, emoji);
+      const dto = (await this.hydrate([message], repos))[0]!;
+      if (changed) {
+        await repos.events.publish({
+          type: add ? EVENTS.REACTION_ADDED : EVENTS.REACTION_REMOVED,
+          workspaceId: actor.workspaceId,
+          actorId: actor.userId,
+          data: {
+            messageId: dto.id,
+            conversationId: dto.conversationId,
+            parentId: dto.parentId,
+            authorId: dto.authorId,
+            emoji,
+            reactions: dto.reactions,
+          },
+        });
+      }
+      return dto;
+    });
   }
 
   async setPinned(actor: MemberContext, messageId: string, pinned: boolean): Promise<MessageDto> {
     const message = await this.loadMessage(actor, messageId, true);
     if (message.deletedAt) throw new BadRequestError('This message was deleted');
-    const changed = pinned
-      ? await this.uow.repos.messages.pin(message.conversationId, message.id, actor.userId)
-      : await this.uow.repos.messages.unpin(message.conversationId, message.id);
-    const dto = (await this.hydrate([message]))[0]!;
-    if (changed) await this.publishMessageEvent(EVENTS.MESSAGE_UPDATED, actor, dto);
-    return dto;
+    return this.uow.transaction(async (repos) => {
+      const changed = pinned
+        ? await repos.messages.pin(message.conversationId, message.id, actor.userId)
+        : await repos.messages.unpin(message.conversationId, message.id);
+      const dto = (await this.hydrate([message], repos))[0]!;
+      if (changed) await this.publishMessageEvent(repos, EVENTS.MESSAGE_UPDATED, actor, dto);
+      return dto;
+    });
   }
 
   async listPinned(actor: MemberContext, conversationId: string): Promise<MessageDto[]> {
@@ -260,11 +264,10 @@ export class MessageService {
         body: input.body ?? null,
       });
       await repos.conversations.update(conversation.id, { lastMessageAt: created.createdAt });
+      await this.publishCreated(repos, input.authorId, conversation, toMessageDto(created), null);
       return created;
     });
-    const dto = toMessageDto(message);
-    await this.publishCreated(input.authorId, conversation, dto, null);
-    return dto;
+    return toMessageDto(message);
   }
 
   private async access(
@@ -284,19 +287,22 @@ export class MessageService {
     return message;
   }
 
-  private async hydrate(rows: MessageRow[]): Promise<MessageDto[]> {
+  private async hydrate(rows: MessageRow[], repos: Repositories = this.uow.repos): Promise<MessageDto[]> {
     const ids = rows.map((r) => r.id);
-    const [reactionRows, pinned] = await Promise.all([
-      this.uow.repos.messages.reactionsFor(ids),
-      this.uow.repos.messages.pinnedIds(ids),
-    ]);
+    const [reactionRows, pinned] = await Promise.all([repos.messages.reactionsFor(ids), repos.messages.pinnedIds(ids)]);
     const reactions = groupReactions(reactionRows);
     return rows.map((r) => toMessageDto(r, reactions.get(r.id) ?? [], pinned.has(r.id)));
   }
 
-  private async publishCreated(actorId: string, conversation: ConversationRow, message: MessageDto, root: MessageRow | null) {
+  private async publishCreated(
+    repos: Repositories,
+    actorId: string,
+    conversation: ConversationRow,
+    message: MessageDto,
+    root: MessageRow | null,
+  ) {
     const isDirect = conversation.type === 'dm' || conversation.type === 'group_dm';
-    const recipients = isDirect ? await this.uow.repos.conversations.listMemberIds(conversation.id) : [];
+    const recipients = isDirect ? await repos.conversations.listMemberIds(conversation.id) : [];
     const threadRecipients = root ? [root.authorId, ...root.replyUserIds] : [];
     const data: MessageCreatedEvent & { threadParticipantIds: string[] } = {
       message,
@@ -304,10 +310,10 @@ export class MessageService {
       recipientUserIds: recipients.filter((id) => id !== actorId),
       threadParticipantIds: [...new Set(threadRecipients)].filter((id) => id !== actorId),
     };
-    await this.events.publish({ type: EVENTS.MESSAGE_CREATED, workspaceId: conversation.workspaceId, actorId, data });
+    await repos.events.publish({ type: EVENTS.MESSAGE_CREATED, workspaceId: conversation.workspaceId, actorId, data });
   }
 
-  private publishMessageEvent(type: typeof EVENTS.MESSAGE_UPDATED, actor: MemberContext, message: MessageDto) {
-    return this.events.publish({ type, workspaceId: actor.workspaceId, actorId: actor.userId, data: { message } });
+  private publishMessageEvent(repos: Repositories, type: typeof EVENTS.MESSAGE_UPDATED, actor: MemberContext, message: MessageDto) {
+    return repos.events.publish({ type, workspaceId: actor.workspaceId, actorId: actor.userId, data: { message } });
   }
 }

@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import {
+  bigint,
   boolean,
   customType,
   index,
@@ -12,7 +13,7 @@ import {
   uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
-import type { AttachmentDto, ConversationType, MessageKind } from '@novachat-enterprise-erp/contracts';
+import type { AttachmentDto, ConversationType, DomainEvent, EventType, MessageKind } from '@novachat-enterprise-erp/contracts';
 
 export const messagingSchema = pgSchema('messaging');
 
@@ -136,9 +137,34 @@ export const threadParticipants = messagingSchema.table(
   (t) => [primaryKey({ columns: [t.rootId, t.userId] }), index('thread_participants_user_idx').on(t.workspaceId, t.userId)],
 );
 
-export const schema = { conversations, conversationMembers, messages, reactions, pins, threadParticipants };
+/**
+ * Transactional outbox: events are written here in the same transaction as the
+ * state change they describe, then relayed to the event stream by OutboxRelay.
+ * `seq` gives a stable publish order; `event` is the full DomainEvent, so its id
+ * stays the same however many times delivery is retried.
+ */
+export const outbox = messagingSchema.table(
+  'outbox',
+  {
+    seq: bigint('seq', { mode: 'number' }).primaryKey().generatedAlwaysAsIdentity(),
+    eventId: uuid('event_id').notNull().unique(),
+    type: text('type').$type<EventType>().notNull(),
+    event: jsonb('event').$type<DomainEvent>().notNull(),
+    createdAt: ts('created_at').notNull().defaultNow(),
+    publishedAt: ts('published_at'),
+    attempts: integer('attempts').notNull().default(0),
+    lastError: text('last_error'),
+  },
+  (t) => [
+    index('outbox_pending_idx').on(t.seq).where(sql`${t.publishedAt} is null`),
+    index('outbox_published_idx').on(t.publishedAt).where(sql`${t.publishedAt} is not null`),
+  ],
+);
+
+export const schema = { conversations, conversationMembers, messages, reactions, pins, threadParticipants, outbox };
 
 export type ConversationRow = typeof conversations.$inferSelect;
 export type ConversationMemberRow = typeof conversationMembers.$inferSelect;
 export type MessageRow = typeof messages.$inferSelect;
 export type ReactionRow = typeof reactions.$inferSelect;
+export type OutboxRow = typeof outbox.$inferSelect;
